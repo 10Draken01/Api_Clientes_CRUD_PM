@@ -1,0 +1,666 @@
+// controllers/user.controller.go
+package controllers
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"math"
+	"fmt"
+	"regexp"
+	"time"
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"api_compiladores/src/models"
+	"api_compiladores/src/utils"
+	"api_compiladores/src/types"
+)
+
+type ExampleClienteCreate struct {
+	Clave_Cliente string `json:"clave_cliente" example:"001"`
+	Nombre        string `json:"nombre" example:"Pedro"`
+	Celular       string `json:"celular" example:"9613214782"`
+	Email         string `json:"email" example:"correo@example.com"`
+}
+
+type ExampleClientePut struct {
+	Nombre        string `json:"nombre" example:"Pedro"`
+	Celular       string `json:"celular" example:"9613214782"`
+	Email         string `json:"email" example:"correo@example.com"`
+}
+
+var (
+	// Expresiones regulares reutilizables
+	identRegexNumeric = regexp.MustCompile(`^[0-9]*$`)
+)
+
+var clienteCollection *mongo.Collection
+
+var exampleCreate = ExampleClienteCreate{
+	Clave_Cliente: "001",
+	Nombre:        "Pedro",
+	Celular:       "9613214782",
+	Email:         "correo@example.com",
+}
+
+var examplePut = ExampleClientePut{
+	Nombre:  "Pedro",
+	Celular: "9613214782",
+	Email:   "correo@example.com",
+}
+
+func SetClienteCollection(c *mongo.Collection) {
+	clienteCollection = c
+}
+
+// CreateCliente - Crear cliente con invalidación inteligente de caché
+func CreateCliente(c *gin.Context) {
+	var cliente models.Cliente
+	if err := c.ShouldBindJSON(&cliente); err != nil {
+		sendErrorResponse(c, http.StatusBadRequest, "Datos JSON inválidos", err.Error(), &exampleCreate)
+		return
+	}
+
+	if cliente.Clave_Cliente == nil {
+		sendErrorResponse(c, http.StatusBadRequest, "Clave_Cliente es obligatorio", nil, &exampleCreate)
+		return
+	}
+
+	log.Printf("Creando cliente con Clave_Cliente: %v", cliente.Clave_Cliente)
+	claveCliente, err := normalizeClaveCliente(cliente.Clave_Cliente)
+	if err != nil {
+		sendErrorResponse(c, http.StatusBadRequest, err.Error(), nil, &exampleCreate)
+		return
+	}
+
+	cliente.ID = primitive.NewObjectID()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Verificar existencia previa (primero en caché, luego en DB)
+	if cachedCliente, found, _ := utils.GetCachedSingleCliente(claveCliente); found && cachedCliente != nil {
+		log.Printf("Cliente %s ya existe (encontrado en caché)", claveCliente)
+		sendErrorResponse(c, http.StatusBadRequest, 
+			fmt.Sprintf("El cliente con Clave_Cliente %s ya existe", claveCliente), 
+			nil, &exampleCreate)
+		return
+	}
+
+	// Verificar en base de datos
+	var existingCliente models.Cliente
+	err = clienteCollection.FindOne(ctx, bson.M{"clave_cliente": claveCliente}).Decode(&existingCliente)
+	if err == nil {
+		// Cliente existe, guardarlo en caché para futuras consultas
+		utils.CacheSingleCliente(claveCliente, existingCliente, utils.DefaultTTL)
+		sendErrorResponse(c, http.StatusBadRequest,
+			fmt.Sprintf("El cliente con Clave_Cliente %s ya existe", claveCliente),
+			nil, &exampleCreate)
+		return
+	} else if err != mongo.ErrNoDocuments {
+		log.Printf("Error al verificar existencia de cliente: %v", err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error interno del servidor", nil, nil)
+		return
+	}
+
+	cliente.Clave_Cliente = claveCliente
+	errores := utils.ValidateCliente(cliente)
+	if errores != nil {
+		sendErrorResponse(c, http.StatusBadRequest,
+			"Datos de cliente inválidos",
+			errores,
+			&exampleCreate)
+		return
+	}
+
+	// Insertar en base de datos
+	if _, err := clienteCollection.InsertOne(ctx, cliente); err != nil {
+		log.Printf("Error al insertar cliente: %v", err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error al insertar cliente", nil, nil)
+		return
+	}
+
+	// Invalidar caché relacionado (async para no bloquear la respuesta)
+	go func() {
+		if err := utils.InvalidateAllClientesCache(); err != nil {
+			log.Printf("Error invalidando caché tras crear cliente: %v", err)
+		}
+		utils.UpdateCacheStats("invalidate")
+	}()
+
+	// Cachear el nuevo cliente
+	go utils.CacheSingleCliente(claveCliente, cliente, utils.DefaultTTL)
+
+	sendSuccessResponse(c, http.StatusCreated, "Cliente creado exitosamente", cliente, nil)
+}
+
+func GetClientes(c *gin.Context) {
+	page := c.Param("page")
+
+	if page == "" {
+		sendErrorResponse(c, http.StatusBadRequest,
+			"El atributo page es obligatorio | debe ser un número entero del 1 al 10000",
+			nil, "1")
+		return
+	}
+
+	if !identRegexNumeric.MatchString(page) {
+		sendErrorResponse(c, http.StatusBadRequest,
+			fmt.Sprintf("%s no es un identificador válido", page),
+			nil, "1")
+		return
+	}
+
+	intPage, err := strconv.Atoi(page)
+	if err != nil {
+		sendErrorResponse(c, http.StatusBadRequest, "Page debe ser un número válido", nil, "1")
+		return
+	}
+
+	if intPage < 1 || intPage > 10000 {
+		sendErrorResponse(c, http.StatusBadRequest,
+			fmt.Sprintf("%s no es un número válido | debe ser un número entero del 1 al 10000", page),
+			nil, "1")
+		return
+	}
+
+	limit := int64(100)
+	skip := int64((intPage - 1) * int(limit))
+
+	// Intentar obtener desde caché primero
+	if cachedClientes, found, err := utils.GetCachedClientesList(intPage); found && err == nil {
+		utils.UpdateCacheStats("hit")
+
+		meta := &types.MetaInfo{
+			Page:      intPage,
+			Limit:     int(limit),
+			CacheHit:  true,
+			Source:    "cache",
+			Timestamp: time.Now().Unix(),
+		}
+
+		sendSuccessResponse(c, http.StatusOK, "Clientes obtenidos desde caché", cachedClientes, meta)
+		return
+	}
+
+	utils.UpdateCacheStats("miss")
+
+	var clientes []models.Cliente
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var total int64 = 0
+	if intPage == 1 {
+		// Contar total documentos sólo para la primera página
+		total, err = clienteCollection.CountDocuments(ctx, bson.M{})
+		if err != nil {
+			log.Printf("Error contando documentos: %v", err)
+			// Puedes decidir retornar error o continuar con total=0
+		}
+	}
+
+	// Opciones de búsqueda con paginación
+	findOptions := options.Find()
+	findOptions.SetLimit(limit)
+	findOptions.SetSkip(skip)
+	// Ordenar por Clave_Cliente para aprovechar el índice
+	findOptions.SetSort(bson.D{{Key: "clave_cliente", Value: 1}})
+
+	// Ejecutar consulta
+	cursor, err := clienteCollection.Find(ctx, bson.M{}, findOptions)
+	if err != nil {
+		log.Printf("Error al obtener clientes: %v", err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error al obtener clientes", nil, nil)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var cliente models.Cliente
+		if err := cursor.Decode(&cliente); err != nil {
+			log.Printf("Error decodificando cliente: %v", err)
+			sendErrorResponse(c, http.StatusInternalServerError, "Error decodificando cliente", nil, nil)
+			return
+		}
+		clientes = append(clientes, cliente)
+	}
+
+	if err := cursor.Err(); err != nil {
+		log.Printf("Cursor error: %v", err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error en cursor de clientes", nil, nil)
+		return
+	}
+
+	// Guardar en caché de forma asíncrona (no bloquea la respuesta)
+	go func(page int, data []models.Cliente) {
+		if err := utils.CacheClientesList(page, data, utils.DefaultTTL); err != nil {
+			log.Printf("Error guardando página %d en caché: %v", page, err)
+		}
+		utils.UpdateCacheStats("set")
+	}(intPage, clientes)
+
+	meta := &types.MetaInfo{
+		Page:      intPage,
+		Limit:     int(limit),
+		Total:     total,
+		CacheHit:  false,
+		Source:    "database",
+		Timestamp: time.Now().Unix(),
+	}
+
+	sendSuccessResponse(c, http.StatusOK, "Clientes obtenidos desde base de datos", clientes, meta)
+}
+
+
+// GetCliente - Obtener cliente individual con caché
+func GetCliente(c *gin.Context) {
+	claveCliente := c.Param("clave_cliente")
+	
+	// Intentar obtener desde caché primero
+	if cachedCliente, found, err := utils.GetCachedSingleCliente(claveCliente); found && err == nil {
+		utils.UpdateCacheStats("hit")
+		
+		meta := &types.MetaInfo{
+			CacheHit:  true,
+			Source:    "cache",
+			Timestamp: time.Now().Unix(),
+		}
+		
+		sendSuccessResponse(c, http.StatusOK, "Cliente obtenido desde caché", cachedCliente, meta)
+		return
+	}
+
+	// Si no está en caché, obtener de la base de datos
+	utils.UpdateCacheStats("miss")
+	
+	var cliente models.Cliente
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := clienteCollection.FindOne(ctx, bson.M{"clave_cliente": claveCliente}).Decode(&cliente)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			sendErrorResponse(c, http.StatusNotFound, "Cliente no encontrado", nil, nil)
+		} else {
+			log.Printf("Error obteniendo cliente %s: %v", claveCliente, err)
+			sendErrorResponse(c, http.StatusInternalServerError, "Error interno del servidor", nil, nil)
+		}
+		return
+	}
+
+	// Guardar en caché de forma asíncrona
+	go func() {
+		if err := utils.CacheSingleCliente(claveCliente, cliente, utils.LongTTL); err != nil {
+			log.Printf("Error guardando cliente %s en caché: %v", claveCliente, err)
+		}
+		utils.UpdateCacheStats("set")
+	}()
+
+	meta := &types.MetaInfo{
+		CacheHit:  false,
+		Source:    "database",
+		Timestamp: time.Now().Unix(),
+	}
+
+	sendSuccessResponse(c, http.StatusOK, "Cliente obtenido desde base de datos", cliente, meta)
+}
+
+// UpdateCliente - Actualizar cliente con invalidación de caché
+func UpdateCliente(c *gin.Context) {
+	claveCliente := c.Param("clave_cliente")
+	if claveCliente == "" {
+		sendErrorResponse(c, http.StatusBadRequest, "El campo Clave_Cliente es obligatorio", nil, nil)
+		return
+	}
+
+	var cliente models.Cliente
+	if err := c.ShouldBindJSON(&cliente); err != nil {
+		sendErrorResponse(c, http.StatusBadRequest, "Datos JSON inválidos", err.Error(), &examplePut)
+		return
+	}
+	
+	var clienteResponse models.Cliente
+	clienteResponse.Clave_Cliente = claveCliente
+	clienteResponse.Nombre = cliente.Nombre
+	clienteResponse.Celular = cliente.Celular
+	clienteResponse.Email = cliente.Email
+	clienteResponse.Character_Icon = cliente.Character_Icon
+
+	errores := utils.ValidateCliente(clienteResponse)
+	if errores != nil {
+		sendErrorResponse(c, http.StatusBadRequest,
+			"Datos de cliente inválidos",
+			errores,
+			&exampleCreate)
+		return
+	}
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"nombre":  clienteResponse.Nombre,
+			"celular": clienteResponse.Celular,
+			"email":   clienteResponse.Email,
+		},
+	}
+
+	err := clienteCollection.FindOneAndUpdate(ctx, bson.M{"clave_cliente": claveCliente}, update).Decode(&cliente)
+	if err != nil {
+		log.Printf("Error al actualizar cliente %s: %v", claveCliente, err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error al actualizar cliente", nil, nil)
+		return
+	}
+
+	clienteResponse.ID = cliente.ID
+
+	// Invalidar caché de forma asíncrona
+	go func() {
+		if err := utils.InvalidateClienteCache(claveCliente); err != nil {
+			log.Printf("Error invalidando caché para cliente %s: %v", claveCliente, err)
+		}
+		utils.UpdateCacheStats("invalidate")
+	}()
+
+	// Cachear el cliente actualizado
+	go utils.CacheSingleCliente(claveCliente, 
+		clienteResponse, 
+		utils.DefaultTTL)
+
+	sendSuccessResponse(c, http.StatusOK, "Cliente actualizado exitosamente", clienteResponse, nil)
+}
+
+// DeleteCliente - Eliminar cliente con invalidación de caché
+func DeleteCliente(c *gin.Context) {
+	claveCliente := c.Param("clave_cliente")
+	if claveCliente == "" {
+		sendErrorResponse(c, http.StatusBadRequest, "El campo Clave_Cliente es obligatorio", nil, nil)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := clienteCollection.DeleteOne(ctx, bson.M{"clave_cliente": claveCliente})
+	if err != nil {
+		log.Printf("Error al eliminar cliente %s: %v", claveCliente, err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error al eliminar cliente", nil, nil)
+		return
+	}
+
+	if result.DeletedCount == 0 {
+		sendErrorResponse(c, http.StatusNotFound, "Cliente no encontrado", nil, nil)
+		return
+	}
+
+	// Invalidar caché de forma asíncrona
+	go func() {
+		if err := utils.InvalidateClienteCache(claveCliente); err != nil {
+			log.Printf("Error invalidando caché para cliente eliminado %s: %v", claveCliente, err)
+		}
+		utils.UpdateCacheStats("invalidate")
+	}()
+
+	sendSuccessResponse(c, http.StatusOK, "Cliente eliminado exitosamente", nil, nil)
+}
+
+// GetCacheStats - Obtener estadísticas de caché
+func GetCacheStats(c *gin.Context) {
+	stats, err := utils.GetCacheStats()
+	if err != nil {
+		sendErrorResponse(c, http.StatusInternalServerError, "Error obteniendo estadísticas de caché", err.Error(), nil)
+		return
+	}
+
+	meta := &types.MetaInfo{
+		Source:    "redis",
+		Timestamp: time.Now().Unix(),
+	}
+
+	sendSuccessResponse(c, http.StatusOK, "Estadísticas de caché obtenidas", stats, meta)
+}
+
+// ClearCache - Limpiar todo el caché (endpoint administrativo)
+func ClearCache(c *gin.Context) {
+	if err := utils.InvalidateAllClientesCache(); err != nil {
+		sendErrorResponse(c, http.StatusInternalServerError, "Error limpiando caché", err.Error(), nil)
+		return
+	}
+
+	utils.UpdateCacheStats("invalidate")
+	sendSuccessResponse(c, http.StatusOK, "Caché limpiado exitosamente", nil, nil)
+}
+
+// HealthCheck - Verificar salud de Redis y MongoDB
+func HealthCheck(c *gin.Context) {
+	health := map[string]interface{}{
+		"status":    "ok",
+		"timestamp": time.Now().Unix(),
+		"services":  make(map[string]interface{}),
+	}
+
+	// Verificar Redis
+	if err := utils.CheckRedisHealth(); err != nil {
+		health["services"].(map[string]interface{})["redis"] = map[string]interface{}{
+			"status": "down",
+			"error":  err.Error(),
+		}
+		health["status"] = "degraded"
+	} else {
+		health["services"].(map[string]interface{})["redis"] = map[string]interface{}{
+			"status": "up",
+		}
+	}
+
+	// Verificar MongoDB
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := clienteCollection.Database().Client().Ping(ctx, nil); err != nil {
+		health["services"].(map[string]interface{})["mongodb"] = map[string]interface{}{
+			"status": "down",
+			"error":  err.Error(),
+		}
+		health["status"] = "down"
+	} else {
+		health["services"].(map[string]interface{})["mongodb"] = map[string]interface{}{
+			"status": "up",
+		}
+	}
+
+	// Determinar código de respuesta HTTP
+	statusCode := http.StatusOK
+	if health["status"] == "down" {
+		statusCode = http.StatusServiceUnavailable
+	} else if health["status"] == "degraded" {
+		statusCode = http.StatusPartialContent
+	}
+
+	c.JSON(statusCode, health)
+}
+
+// === FUNCIONES AUXILIARES ===
+
+// normalizeClaveCliente - Normalizar y validar clave de cliente
+func normalizeClaveCliente(claveCliente interface{}) (string, error) {
+	var claveStr string
+	
+	switch v := claveCliente.(type) {
+	case string:
+		claveStr = v
+		return claveStr, nil
+	case float64:
+		claveStr = fmt.Sprintf("%.0f", v)
+		return claveStr, nil
+	case int:
+		claveStr = strconv.Itoa(v)
+		return claveStr, nil
+	case int64:
+		claveStr = strconv.FormatInt(v, 10)
+		return claveStr, nil
+	default:
+		return "", fmt.Errorf("tipo de Clave_Cliente no soportado")
+	}
+
+	// Validar que sea numérico
+	if !identRegexNumeric.MatchString(claveStr) {
+		return "", fmt.Errorf("Clave_Cliente debe contener solo números")
+	}
+
+	return "", fmt.Errorf("Clave_Cliente inválida")
+}
+
+// sendSuccessResponse - Enviar respuesta exitosa estandarizada
+func sendSuccessResponse(c *gin.Context, statusCode int, message string, data interface{}, meta *types.MetaInfo) {
+	if meta == nil {
+		meta = &types.MetaInfo{
+			Timestamp: time.Now().Unix(),
+		}
+	} else if meta.Timestamp == 0 {
+		meta.Timestamp = time.Now().Unix()
+	}
+
+
+	c.JSON(statusCode, data)
+}
+
+// sendErrorResponse - Enviar respuesta de error estandarizada
+func sendErrorResponse(c *gin.Context, statusCode int, message string, errorData interface{}, example interface{}) {
+	response := types.APIResponse{
+		Success: false,
+		Message: message,
+		Error:   errorData,
+		Meta: &types.MetaInfo{
+			Timestamp: time.Now().Unix(),
+		},
+	}
+
+	// Agregar ejemplo solo si se proporciona
+	if example != nil {
+		response.Data = map[string]interface{}{
+			"example": example,
+		}
+	}
+
+	c.JSON(statusCode, response)
+}
+
+// GetClientesCount - Obtener conteo total de clientes
+func GetClientesCount(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	count, err := clienteCollection.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		log.Printf("Error obteniendo conteo de clientes: %v", err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error obteniendo conteo", nil, nil)
+		return
+	}
+
+	// Calcular páginas totales
+	limit := 100
+	totalPages := int(math.Ceil(float64(count) / float64(limit)))
+
+	data := map[string]interface{}{
+		"total_clientes": count,
+		"total_pages":    totalPages,
+		"items_per_page": limit,
+	}
+
+	meta := &types.MetaInfo{
+		Total:     count,
+		Source:    "database",
+		Timestamp: time.Now().Unix(),
+	}
+
+	sendSuccessResponse(c, http.StatusOK, "Conteo obtenido exitosamente", data, meta)
+}
+
+// SearchClientes - Buscar clientes por criterios
+func SearchClientes(c *gin.Context) {
+	// Obtener parámetros de búsqueda
+	nombre := c.Query("nombre")
+	email := c.Query("email")
+	celular := c.Query("celular")
+	
+	// Validar que al menos un criterio esté presente
+	if nombre == "" && email == "" && celular == "" {
+		sendErrorResponse(c, http.StatusBadRequest, 
+			"Debe proporcionar al menos un criterio de búsqueda (nombre, email o celular)", 
+			nil, 
+			map[string]string{
+				"ejemplo_url": "/api/clientes/search?nombre=Pedro&email=pedro@gmail.com",
+			})
+		return
+	}
+
+	// Construir filtro de búsqueda
+	filter := bson.M{}
+	if nombre != "" {
+		// Búsqueda case-insensitive con regex
+		filter["nombre"] = primitive.Regex{
+			Pattern: nombre,
+			Options: "i",
+		}
+	}
+	if email != "" {
+		filter["email"] = primitive.Regex{
+			Pattern: email,
+			Options: "i",
+		}
+	}
+	if celular != "" {
+		filter["Celular"] = celular
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Limitar resultados de búsqueda
+	limit := int64(50)
+	options := options.Find()
+	options.SetLimit(limit)
+	options.SetSort(bson.D{{"clave_cliente", 1}})
+
+	cursor, err := clienteCollection.Find(ctx, filter, options)
+	if err != nil {
+		log.Printf("Error en búsqueda de clientes: %v", err)
+		sendErrorResponse(c, http.StatusInternalServerError, "Error en búsqueda", nil, nil)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var clientes []models.Cliente
+	for cursor.Next(ctx) {
+		var cliente models.Cliente
+		if err := cursor.Decode(&cliente); err != nil {
+			log.Printf("Error decodificando cliente en búsqueda: %v", err)
+			continue
+		}
+		clientes = append(clientes, cliente)
+	}
+
+	// Obtener conteo total de resultados
+	totalCount, err := clienteCollection.CountDocuments(ctx, filter)
+	if err != nil {
+		log.Printf("Error obteniendo conteo de búsqueda: %v", err)
+		totalCount = int64(len(clientes))
+	}
+
+	meta := &types.MetaInfo{
+		Limit:     int(limit),
+		Total:     totalCount,
+		Source:    "database",
+		Timestamp: time.Now().Unix(),
+	}
+
+	message := fmt.Sprintf("Búsqueda completada: %d resultados encontrados", len(clientes))
+	sendSuccessResponse(c, http.StatusOK, message, clientes, meta)
+}
