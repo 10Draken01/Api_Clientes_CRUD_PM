@@ -137,7 +137,7 @@ func Login(c *gin.Context){
 	err := userCollection.FindOne(ctx, bson.M{"email": user.Email}).Decode(&foundUser)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			sendErrorResponse(c, http.StatusUnauthorized, "Usuario no encontrado", nil, nil)
+			sendErrorResponse(c, http.StatusNotFound, "Usuario no encontrado", nil, nil)
 			return
 		}
 		log.Printf("Error al buscar el usuario: %v", err)
@@ -146,7 +146,7 @@ func Login(c *gin.Context){
 	}
 
 	if err := models.VerificarPassword(foundUser.Password, user.Password); err != nil {
-		sendErrorResponse(c, http.StatusUnauthorized, "Credenciales inválidas", nil, nil)
+		sendErrorResponse(c, http.StatusBadRequest, "Credenciales inválidas", nil, nil)
 		return
 	}
 

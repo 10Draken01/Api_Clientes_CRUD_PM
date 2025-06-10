@@ -23,10 +23,11 @@ import (
 )
 
 type ExampleClienteCreate struct {
-	Clave_Cliente string `json:"clave_cliente" example:"001"`
-	Nombre        string `json:"nombre" example:"Pedro"`
-	Celular       string `json:"celular" example:"9613214782"`
-	Email         string `json:"email" example:"correo@example.com"`
+	Clave_Cliente 	string `json:"clave_cliente" example:"001"`
+	Nombre        	string `json:"nombre" example:"Pedro"`
+	Celular       	string `json:"celular" example:"9613214782"`
+	Email         	string `json:"email" example:"correo@example.com"`
+	Character_Icon 	string `json:"character_icon" example:"1"`
 }
 
 type ExampleClientePut struct {
@@ -349,6 +350,7 @@ func UpdateCliente(c *gin.Context) {
 			"nombre":  clienteResponse.Nombre,
 			"celular": clienteResponse.Celular,
 			"email":   clienteResponse.Email,
+			"character_icon": clienteResponse.Character_Icon,
 		},
 	}
 
